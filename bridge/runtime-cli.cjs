@@ -3524,7 +3524,9 @@ async function spawnV2Worker(opts) {
     opts.cwd
   ]);
   const paneId = splitResult.stdout.split("\n")[0]?.trim();
-  if (!paneId) return null;
+  if (!paneId) {
+    return { paneId: null, startupAssigned: false, startupFailureReason: "pane_id_missing" };
+  }
   const usePromptMode = isPromptModeAgent(opts.agentType);
   const instruction = buildV2TaskInstruction(
     opts.teamName,
@@ -3587,11 +3589,11 @@ async function spawnV2Worker(opts) {
   if (!usePromptMode) {
     const paneReady = await waitForPaneReady(paneId);
     if (!paneReady) {
-      try {
-        await execFileAsync("tmux", ["kill-pane", "-t", paneId]);
-      } catch {
-      }
-      return null;
+      return {
+        paneId,
+        startupAssigned: false,
+        startupFailureReason: "worker_pane_not_ready"
+      };
     }
   }
   const dispatchOutcome = await queueInboxInstruction({
@@ -3623,13 +3625,16 @@ async function spawnV2Worker(opts) {
     }
   });
   if (!dispatchOutcome.ok) {
-    try {
-      await execFileAsync("tmux", ["kill-pane", "-t", paneId]);
-    } catch {
-    }
-    return null;
+    return {
+      paneId,
+      startupAssigned: false,
+      startupFailureReason: dispatchOutcome.reason
+    };
   }
-  return paneId;
+  return {
+    paneId,
+    startupAssigned: true
+  };
 }
 async function startTeamV2(config) {
   const sanitized = sanitizeTeamName(config.teamName);
@@ -3711,7 +3716,7 @@ async function startTeamV2(config) {
     const taskId = String(i + 1);
     const task = config.tasks[i];
     if (!task) break;
-    const paneId = await spawnV2Worker({
+    const workerLaunch = await spawnV2Worker({
       sessionName: sessionName2,
       leaderPaneId,
       existingWorkerPaneIds: workerPaneIds,
@@ -3724,13 +3729,20 @@ async function startTeamV2(config) {
       cwd: leaderCwd,
       resolvedBinaryPaths
     });
-    if (paneId) {
-      workerPaneIds.push(paneId);
+    if (workerLaunch.paneId) {
+      workerPaneIds.push(workerLaunch.paneId);
       const workerInfo = workersInfo[i];
       if (workerInfo) {
-        workerInfo.pane_id = paneId;
-        workerInfo.assigned_tasks = [taskId];
+        workerInfo.pane_id = workerLaunch.paneId;
+        workerInfo.assigned_tasks = workerLaunch.startupAssigned ? [taskId] : [];
       }
+    }
+    if (workerLaunch.startupFailureReason) {
+      await appendTeamEvent(sanitized, {
+        type: "team_leader_nudge",
+        worker: "leader-fixed",
+        reason: `startup_manual_intervention_required:${wName}:${workerLaunch.startupFailureReason}`
+      }, leaderCwd);
     }
   }
   teamConfig.workers = workersInfo;

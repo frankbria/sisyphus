@@ -269,11 +269,17 @@ interface SpawnV2WorkerOptions {
   resolvedBinaryPaths: Partial<Record<CliAgentType, string>>;
 }
 
+interface SpawnV2WorkerResult {
+  paneId: string | null;
+  startupAssigned: boolean;
+  startupFailureReason?: string;
+}
+
 /**
  * Spawn a single v2 worker in a tmux pane.
  * Writes CLI API inbox (no done.json), waits for ready, sends inbox path.
  */
-async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<string | null> {
+async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<SpawnV2WorkerResult> {
   const { execFile } = await import('child_process');
   const { promisify } = await import('util');
   const execFileAsync = promisify(execFile);
@@ -290,7 +296,9 @@ async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<string | null>
     '-c', opts.cwd,
   ]);
   const paneId = splitResult.stdout.split('\n')[0]?.trim();
-  if (!paneId) return null;
+  if (!paneId) {
+    return { paneId: null, startupAssigned: false, startupFailureReason: 'pane_id_missing' };
+  }
 
   const usePromptMode = isPromptModeAgent(opts.agentType);
 
@@ -366,8 +374,11 @@ async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<string | null>
   if (!usePromptMode) {
     const paneReady = await waitForPaneReady(paneId);
     if (!paneReady) {
-      try { await execFileAsync('tmux', ['kill-pane', '-t', paneId]); } catch { /* best-effort cleanup */ }
-      return null;
+      return {
+        paneId,
+        startupAssigned: false,
+        startupFailureReason: 'worker_pane_not_ready',
+      };
     }
   }
 
@@ -400,11 +411,17 @@ async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<string | null>
     },
   });
   if (!dispatchOutcome.ok) {
-    try { await execFileAsync('tmux', ['kill-pane', '-t', paneId]); } catch { /* best-effort cleanup */ }
-    return null;
+    return {
+      paneId,
+      startupAssigned: false,
+      startupFailureReason: dispatchOutcome.reason,
+    };
   }
 
-  return paneId;
+  return {
+    paneId,
+    startupAssigned: true,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -510,7 +527,7 @@ export async function startTeamV2(config: StartTeamV2Config): Promise<TeamRuntim
     const task = config.tasks[i];
     if (!task) break;
 
-    const paneId = await spawnV2Worker({
+    const workerLaunch = await spawnV2Worker({
       sessionName,
       leaderPaneId,
       existingWorkerPaneIds: workerPaneIds,
@@ -524,13 +541,21 @@ export async function startTeamV2(config: StartTeamV2Config): Promise<TeamRuntim
       resolvedBinaryPaths,
     });
 
-    if (paneId) {
-      workerPaneIds.push(paneId);
+    if (workerLaunch.paneId) {
+      workerPaneIds.push(workerLaunch.paneId);
       const workerInfo = workersInfo[i];
       if (workerInfo) {
-        workerInfo.pane_id = paneId;
-        workerInfo.assigned_tasks = [taskId];
+        workerInfo.pane_id = workerLaunch.paneId;
+        workerInfo.assigned_tasks = workerLaunch.startupAssigned ? [taskId] : [];
       }
+    }
+
+    if (workerLaunch.startupFailureReason) {
+      await appendTeamEvent(sanitized, {
+        type: 'team_leader_nudge',
+        worker: 'leader-fixed',
+        reason: `startup_manual_intervention_required:${wName}:${workerLaunch.startupFailureReason}`,
+      }, leaderCwd);
     }
   }
 

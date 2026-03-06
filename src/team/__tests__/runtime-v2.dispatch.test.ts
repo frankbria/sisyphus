@@ -112,4 +112,46 @@ describe('runtime v2 startup inbox dispatch', () => {
       }),
     );
   });
+
+
+  it('does not auto-kill a worker pane when startup readiness fails', async () => {
+    cwd = await mkdtemp(join(tmpdir(), 'omc-runtime-v2-no-autokill-ready-'));
+    mocks.waitForPaneReady.mockResolvedValue(false);
+    const { startTeamV2 } = await import('../runtime-v2.js');
+
+    const runtime = await startTeamV2({
+      teamName: 'dispatch-team',
+      workerCount: 1,
+      agentTypes: ['claude'],
+      tasks: [{ subject: 'Dispatch test', description: 'Verify worker pane is preserved for leader cleanup' }],
+      cwd,
+    });
+
+    expect(runtime.config.workers[0]?.pane_id).toBe('%2');
+    expect(runtime.config.workers[0]?.assigned_tasks).toEqual([]);
+    expect(mocks.execFile.mock.calls.some((call) => call[1]?.[0] === 'kill-pane')).toBe(false);
+  });
+
+  it('does not auto-kill a worker pane when startup notification fails', async () => {
+    cwd = await mkdtemp(join(tmpdir(), 'omc-runtime-v2-no-autokill-notify-'));
+    mocks.sendToWorker.mockResolvedValue(false);
+    const { startTeamV2 } = await import('../runtime-v2.js');
+
+    const runtime = await startTeamV2({
+      teamName: 'dispatch-team',
+      workerCount: 1,
+      agentTypes: ['claude'],
+      tasks: [{ subject: 'Dispatch test', description: 'Verify notify failure leaves pane for leader action' }],
+      cwd,
+    });
+
+    expect(runtime.config.workers[0]?.pane_id).toBe('%2');
+    expect(runtime.config.workers[0]?.assigned_tasks).toEqual([]);
+    expect(mocks.execFile.mock.calls.some((call) => call[1]?.[0] === 'kill-pane')).toBe(false);
+
+    const requests = await listDispatchRequests('dispatch-team', cwd, { kind: 'inbox' });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.status).toBe('failed');
+    expect(requests[0]?.last_reason).toBe('worker_notify_failed');
+  });
 });
